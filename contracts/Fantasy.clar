@@ -14,6 +14,13 @@
 (define-constant ERR_INVALID_ROSTER (err u409))
 (define-constant ERR_PLAYER_LIMIT_EXCEEDED (err u410))
 (define-constant ERR_DUPLICATE_PLAYER (err u411))
+(define-constant ERR_TRADE_NOT_FOUND (err u412))
+(define-constant ERR_TRADE_EXPIRED (err u413))
+(define-constant ERR_INVALID_TRADE_STATUS (err u414))
+(define-constant ERR_SAME_TEAM_TRADE (err u415))
+(define-constant ERR_EMPTY_TRADE (err u416))
+
+(define-constant TRADE_DEADLINE_BLOCKS u1440)
 
 (define-constant MAX_TEAMS_PER_LEAGUE u12)
 (define-constant MAX_PLAYERS_PER_TEAM u15)
@@ -23,6 +30,7 @@
 (define-data-var next-league-id uint u1)
 (define-data-var next-team-id uint u1)
 (define-data-var next-player-id uint u1)
+(define-data-var next-trade-id uint u1)
 
 ;; data maps
 (define-map leagues
@@ -76,6 +84,25 @@
 (define-map league-rankings
   { league-id: uint, rank: uint }
   { team-id: uint, score: uint }
+)
+
+(define-map trades
+  { trade-id: uint }
+  {
+    proposer-team: uint,
+    responder-team: uint,
+    league-id: uint,
+    players-out: (list 5 uint),
+    players-in: (list 5 uint),
+    status: (string-ascii 10),
+    created-at: uint,
+    expires-at: uint
+  }
+)
+
+(define-map trade-history
+  { league-id: uint, trade-id: uint }
+  { completed-at: uint, success: bool }
 )
 
 ;; public functions
@@ -281,6 +308,112 @@
   )
 )
 
+(define-public (propose-trade (to-team uint) (players-out (list 5 uint)) (players-in (list 5 uint)))
+  (let
+    (
+      (trade-id (var-get next-trade-id))
+      (proposer-team-id (unwrap! (get-team-id-by-owner tx-sender) ERR_TEAM_NOT_FOUND))
+      (responder-team (unwrap! (map-get? teams { team-id: to-team }) ERR_TEAM_NOT_FOUND))
+      (proposer-team (unwrap! (map-get? teams { team-id: proposer-team-id }) ERR_TEAM_NOT_FOUND))
+      (league-id (get league-id proposer-team))
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_LEAGUE_NOT_FOUND))
+      (expires-at (+ stacks-block-height TRADE_DEADLINE_BLOCKS))
+    )
+    (asserts! (is-eq (get status league) "active") ERR_LEAGUE_STARTED)
+    (asserts! (is-eq (get league-id responder-team) league-id) (err u400))
+    (asserts! (not (is-eq proposer-team-id to-team)) ERR_SAME_TEAM_TRADE)
+    (asserts! (and (> (len players-out) u0) (> (len players-in) u0)) ERR_EMPTY_TRADE)
+    (asserts! (unwrap! (validate-trade-players proposer-team-id to-team players-out players-in) (err u400)) (err u400))
+    
+    (map-set trades
+      { trade-id: trade-id }
+      {
+        proposer-team: proposer-team-id,
+        responder-team: to-team,
+        league-id: league-id,
+        players-out: players-out,
+        players-in: players-in,
+        status: "pending",
+        created-at: stacks-block-height,
+        expires-at: expires-at
+      }
+    )
+    
+    (var-set next-trade-id (+ trade-id u1))
+    (ok trade-id)
+  )
+)
+
+(define-public (accept-trade (trade-id uint))
+  (let
+    (
+      (trade (unwrap! (map-get? trades { trade-id: trade-id }) ERR_TRADE_NOT_FOUND))
+      (responder-team-id (unwrap! (get-team-id-by-owner tx-sender) ERR_TEAM_NOT_FOUND))
+      (league (unwrap! (map-get? leagues { league-id: (get league-id trade) }) ERR_LEAGUE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get status league) "active") ERR_LEAGUE_STARTED)
+    (asserts! (is-eq responder-team-id (get responder-team trade)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status trade) "pending") ERR_INVALID_TRADE_STATUS)
+    (asserts! (< stacks-block-height (get expires-at trade)) ERR_TRADE_EXPIRED)
+    (asserts! (unwrap! (validate-trade-players (get proposer-team trade) (get responder-team trade) (get players-out trade) (get players-in trade)) (err u400)) (err u400))
+    
+    (try! (execute-trade-swap (get proposer-team trade) (get responder-team trade) (get players-out trade) (get players-in trade)))
+    
+    (map-set trades
+      { trade-id: trade-id }
+      (merge trade { status: "accepted" })
+    )
+    
+    (map-set trade-history
+      { league-id: (get league-id trade), trade-id: trade-id }
+      { completed-at: stacks-block-height, success: true }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reject-trade (trade-id uint))
+  (let
+    (
+      (trade (unwrap! (map-get? trades { trade-id: trade-id }) ERR_TRADE_NOT_FOUND))
+      (responder-team-id (unwrap! (get-team-id-by-owner tx-sender) ERR_TEAM_NOT_FOUND))
+    )
+    (asserts! (is-eq responder-team-id (get responder-team trade)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status trade) "pending") ERR_INVALID_TRADE_STATUS)
+    
+    (map-set trades
+      { trade-id: trade-id }
+      (merge trade { status: "rejected" })
+    )
+    
+    (map-set trade-history
+      { league-id: (get league-id trade), trade-id: trade-id }
+      { completed-at: stacks-block-height, success: false }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (cancel-trade (trade-id uint))
+  (let
+    (
+      (trade (unwrap! (map-get? trades { trade-id: trade-id }) ERR_TRADE_NOT_FOUND))
+      (proposer-team-id (unwrap! (get-team-id-by-owner tx-sender) ERR_TEAM_NOT_FOUND))
+    )
+    (asserts! (is-eq proposer-team-id (get proposer-team trade)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status trade) "pending") ERR_INVALID_TRADE_STATUS)
+    
+    (map-set trades
+      { trade-id: trade-id }
+      (merge trade { status: "cancelled" })
+    )
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-league (league-id uint))
@@ -312,6 +445,21 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-trade (trade-id uint))
+  (map-get? trades { trade-id: trade-id })
+)
+
+(define-read-only (get-trade-history (league-id uint) (trade-id uint))
+  (map-get? trade-history { league-id: league-id, trade-id: trade-id })
+)
+
+(define-read-only (is-trade-expired (trade-id uint))
+  (match (map-get? trades { trade-id: trade-id })
+    trade (ok (>= stacks-block-height (get expires-at trade)))
+    ERR_TRADE_NOT_FOUND
+  )
 )
 
 ;; private functions
@@ -407,5 +555,98 @@
       
       (ok true)
     )
+  )
+)
+
+(define-private (get-team-id-by-owner (owner principal))
+  (let
+    (
+      (team-id-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12))
+    )
+    (fold find-team-id-by-owner team-id-list none)
+  )
+)
+
+(define-private (find-team-id-by-owner (team-id uint) (found (optional uint)))
+  (match found
+    some-id found
+    (match (map-get? teams { team-id: team-id })
+      team (if (is-eq (get owner team) tx-sender) (some team-id) none)
+      none
+    )
+  )
+)
+
+(define-private (validate-trade-players (proposer-team uint) (responder-team uint) (players-out (list 5 uint)) (players-in (list 5 uint)))
+  (let
+    (
+      (out-valid (fold validate-player-ownership players-out { team-id: proposer-team, valid: true }))
+      (in-valid (fold validate-player-ownership players-in { team-id: responder-team, valid: true }))
+    )
+    (ok (and (get valid out-valid) (get valid in-valid)))
+  )
+)
+
+(define-private (validate-player-ownership (player-id uint) (context { team-id: uint, valid: bool }))
+  (if (get valid context)
+    (match (map-get? team-rosters { team-id: (get team-id context), player-id: player-id })
+      roster-entry { team-id: (get team-id context), valid: true }
+      { team-id: (get team-id context), valid: false }
+    )
+    { team-id: (get team-id context), valid: false }
+  )
+)
+
+(define-private (execute-trade-swap (proposer-team uint) (responder-team uint) (players-out (list 5 uint)) (players-in (list 5 uint)))
+  (let
+    (
+      (remove-out (fold remove-player-from-team players-out { team-id: proposer-team, success: true }))
+      (remove-in (fold remove-player-from-team players-in { team-id: responder-team, success: true }))
+      (add-out (fold add-player-to-team players-out { team-id: responder-team, success: true }))
+      (add-in (fold add-player-to-team players-in { team-id: proposer-team, success: true }))
+    )
+    (if (and (get success remove-out) (get success remove-in) (get success add-out) (get success add-in))
+      (ok true)
+      (err u500)
+    )
+  )
+)
+
+(define-private (remove-player-from-team (player-id uint) (context { team-id: uint, success: bool }))
+  (if (get success context)
+    (match (map-get? teams { team-id: (get team-id context) })
+      team
+        (begin
+          (map-delete team-rosters { team-id: (get team-id context), player-id: player-id })
+          (map-set teams
+            { team-id: (get team-id context) }
+            (merge team { roster-count: (- (get roster-count team) u1) })
+          )
+          context
+        )
+      context
+    )
+    context
+  )
+)
+
+(define-private (add-player-to-team (player-id uint) (context { team-id: uint, success: bool }))
+  (if (get success context)
+    (match (map-get? teams { team-id: (get team-id context) })
+      team
+        (begin
+          (map-set team-rosters
+            { team-id: (get team-id context), player-id: player-id }
+            { active: true }
+          )
+          (map-set teams
+            { team-id: (get team-id context) }
+            (merge team { roster-count: (+ (get roster-count team) u1) })
+          )
+          context
+        )
+      context
+    )
+    context
   )
 )
