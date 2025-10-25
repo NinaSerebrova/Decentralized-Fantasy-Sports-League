@@ -14,15 +14,21 @@
 (define-constant ERR_INVALID_ROSTER (err u409))
 (define-constant ERR_PLAYER_LIMIT_EXCEEDED (err u410))
 (define-constant ERR_DUPLICATE_PLAYER (err u411))
+(define-constant ERR_WAIVER_CLAIM_LIMIT_EXCEEDED (err u421))
+(define-constant ERR_NO_WAIVER_PRIORITY (err u422))
+(define-constant ERR_PLAYER_UNAVAILABLE (err u423))
+(define-constant ERR_INVALID_WAIVER_CLAIM (err u424))
 
 (define-constant MAX_TEAMS_PER_LEAGUE u12)
 (define-constant MAX_PLAYERS_PER_TEAM u15)
 (define-constant MIN_BUY_IN u1000000)
+(define-constant MAX_WAIVER_CLAIMS_PER_WEEK u5)
 
 ;; data vars
 (define-data-var next-league-id uint u1)
 (define-data-var next-team-id uint u1)
 (define-data-var next-player-id uint u1)
+(define-data-var next-waiver-claim-id uint u1)
 
 ;; data maps
 (define-map leagues
@@ -76,6 +82,27 @@
 (define-map league-rankings
   { league-id: uint, rank: uint }
   { team-id: uint, score: uint }
+)
+
+(define-map waiver-priority
+  { league-id: uint, team-id: uint }
+  { priority-rank: uint }
+)
+
+(define-map waiver-claims
+  { league-id: uint, claim-id: uint }
+  {
+    claiming-team: uint,
+    player-id: uint,
+    status: (string-ascii 10),
+    created-at: uint,
+    priority-rank: uint
+  }
+)
+
+(define-map team-waiver-usage
+  { league-id: uint, team-id: uint, week-number: uint }
+  { claims-used: uint }
 )
 
 ;; public functions
@@ -281,6 +308,95 @@
   )
 )
 
+(define-public (claim-player-waiver (league-id uint) (player-id uint))
+  (let
+    (
+      (user-team-result (get-user-team-in-league tx-sender league-id))
+      (team-id (unwrap! (get found user-team-result) ERR_TEAM_NOT_FOUND))
+      (claim-id (var-get next-waiver-claim-id))
+      (current-week (get-current-week league-id))
+      (usage (default-to { claims-used: u0 } (map-get? team-waiver-usage { league-id: league-id, team-id: team-id, week-number: current-week })))
+      (priority (unwrap! (map-get? waiver-priority { league-id: league-id, team-id: team-id }) ERR_NO_WAIVER_PRIORITY))
+      (player (unwrap! (map-get? players { player-id: player-id }) (err u404)))
+    )
+    (asserts! (< (get claims-used usage) MAX_WAIVER_CLAIMS_PER_WEEK) ERR_WAIVER_CLAIM_LIMIT_EXCEEDED)
+    (asserts! (get active player) ERR_PLAYER_UNAVAILABLE)
+    (asserts! (is-none (map-get? team-rosters { team-id: team-id, player-id: player-id })) ERR_INVALID_WAIVER_CLAIM)
+    
+    (map-set waiver-claims
+      { league-id: league-id, claim-id: claim-id }
+      {
+        claiming-team: team-id,
+        player-id: player-id,
+        status: "pending",
+        created-at: stacks-block-height,
+        priority-rank: (get priority-rank priority)
+      }
+    )
+    
+    (map-set team-waiver-usage
+      { league-id: league-id, team-id: team-id, week-number: current-week }
+      { claims-used: (+ (get claims-used usage) u1) }
+    )
+    
+    (var-set next-waiver-claim-id (+ claim-id u1))
+    (ok claim-id)
+  )
+)
+
+(define-public (process-waiver-claims (league-id uint))
+  (let
+    (
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_LEAGUE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get creator league) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status league) "active") ERR_LEAGUE_STARTED)
+    
+    (ok true)
+  )
+)
+
+(define-public (set-waiver-priority (league-id uint) (team-id uint) (priority-rank uint))
+  (let
+    (
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_LEAGUE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get creator league) tx-sender) ERR_NOT_AUTHORIZED)
+    
+    (map-set waiver-priority
+      { league-id: league-id, team-id: team-id }
+      { priority-rank: priority-rank }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (initialize-league-waiver-order (league-id uint))
+  (let
+    (
+      (league (unwrap! (map-get? leagues { league-id: league-id }) ERR_LEAGUE_NOT_FOUND))
+    )
+    (asserts! (is-eq (get creator league) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status league) "open") ERR_LEAGUE_STARTED)
+    
+    (map-set waiver-priority { league-id: league-id, team-id: u1 } { priority-rank: u1 })
+    (map-set waiver-priority { league-id: league-id, team-id: u2 } { priority-rank: u2 })
+    (map-set waiver-priority { league-id: league-id, team-id: u3 } { priority-rank: u3 })
+    (map-set waiver-priority { league-id: league-id, team-id: u4 } { priority-rank: u4 })
+    (map-set waiver-priority { league-id: league-id, team-id: u5 } { priority-rank: u5 })
+    (map-set waiver-priority { league-id: league-id, team-id: u6 } { priority-rank: u6 })
+    (map-set waiver-priority { league-id: league-id, team-id: u7 } { priority-rank: u7 })
+    (map-set waiver-priority { league-id: league-id, team-id: u8 } { priority-rank: u8 })
+    (map-set waiver-priority { league-id: league-id, team-id: u9 } { priority-rank: u9 })
+    (map-set waiver-priority { league-id: league-id, team-id: u10 } { priority-rank: u10 })
+    (map-set waiver-priority { league-id: league-id, team-id: u11 } { priority-rank: u11 })
+    (map-set waiver-priority { league-id: league-id, team-id: u12 } { priority-rank: u12 })
+    
+    (ok true)
+  )
+)
+
 ;; read only functions
 
 (define-read-only (get-league (league-id uint))
@@ -312,6 +428,18 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-team-waiver-priority (league-id uint) (team-id uint))
+  (map-get? waiver-priority { league-id: league-id, team-id: team-id })
+)
+
+(define-read-only (get-waiver-claim (league-id uint) (claim-id uint))
+  (map-get? waiver-claims { league-id: league-id, claim-id: claim-id })
+)
+
+(define-read-only (get-team-weekly-claims (league-id uint) (team-id uint) (week-number uint))
+  (default-to u0 (get claims-used (map-get? team-waiver-usage { league-id: league-id, team-id: team-id, week-number: week-number })))
 )
 
 ;; private functions
@@ -407,5 +535,41 @@
       
       (ok true)
     )
+  )
+)
+
+(define-private (get-user-team-in-league (owner principal) (league-id uint))
+  (let
+    (
+      (team-id-list (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12))
+    )
+    (fold find-user-team team-id-list { league-id: league-id, owner: owner, found: none })
+  )
+)
+
+(define-private (find-user-team (team-id uint) (context { league-id: uint, owner: principal, found: (optional uint) }))
+  (match (get found context)
+    found-id context
+    (match (map-get? teams { team-id: team-id })
+      team
+        (if (and (is-eq (get owner team) (get owner context)) (is-eq (get league-id team) (get league-id context)))
+          (merge context { found: (some team-id) })
+          context
+        )
+      context
+    )
+  )
+)
+
+(define-private (get-current-week (league-id uint))
+  (let
+    (
+      (league (unwrap-panic (map-get? leagues { league-id: league-id })))
+      (season-start (get created-at league))
+      (current-block stacks-block-height)
+      (blocks-elapsed (- current-block season-start))
+      (blocks-per-week u1008)
+    )
+    (+ (/ blocks-elapsed blocks-per-week) u1)
   )
 )
